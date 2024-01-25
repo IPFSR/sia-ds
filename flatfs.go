@@ -4,14 +4,17 @@
 package flatfs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,9 +26,21 @@ import (
 	"github.com/jbenet/goprocess"
 
 	logging "github.com/ipfs/go-log/v2"
+
+	rapi "go.sia.tech/renterd/api"
+	rbclient "go.sia.tech/renterd/bus/client"
+	rwclient "go.sia.tech/renterd/worker/client"
 )
 
 var log = logging.Logger("flatfs")
+
+const (
+	SIA_PASS     = "IPFS_SIA_RENTERD_PASSWORD"
+	SIA_ADDR     = "IPFS_SIA_RENTERD_WORKER_ADDRESS"
+	SIA_BUCKET   = "IPFS_SIA_RENTERD_BUCKET"
+	SIA_SYNC_DEL = "IPFS_SIA_SYNC_DELETE"
+	defbucket    = "IPFS"
+)
 
 const (
 	extension                  = ".data"
@@ -151,6 +166,12 @@ type Datastore struct {
 	// opMap handles concurrent write operations (put/delete)
 	// to the same key
 	opMap *opMap
+
+	// Sia renterd clients
+	wClient     *rwclient.Client
+	bClient     *rbclient.Client
+	bucket      string
+	syncDeletes bool
 }
 
 type diskUsageValue struct {
@@ -169,6 +190,7 @@ type op struct {
 	tmp  string        // temp file path
 	path string        // file path
 	v    []byte        // value
+	ctx  context.Context
 }
 
 // opMap is a synchronisation structure where a single op can be stored
@@ -275,6 +297,48 @@ func Open(path string, syncFiles bool) (*Datastore, error) {
 		return nil, err
 	}
 
+	bucket := defbucket
+	syncDeletes := false
+	rPass, ok := os.LookupEnv(SIA_PASS)
+	if !ok {
+		return nil, fmt.Errorf("enviroment varaible '%s' must be set", SIA_PASS)
+	}
+	rAddr, ok := os.LookupEnv(SIA_ADDR)
+	if !ok {
+		return nil, fmt.Errorf("enviroment varaible '%s' must be set", SIA_ADDR)
+	}
+	rBucket, ok := os.LookupEnv(SIA_BUCKET)
+	if ok {
+		bucket = rBucket
+	}
+	log.Infof("using the bucket %s for renterd", bucket)
+	sd, ok := os.LookupEnv(SIA_SYNC_DEL)
+	if ok {
+		syncD, err := strconv.ParseBool(sd)
+		if err != nil {
+			return nil, fmt.Errorf("parsing '%s': %w", SIA_SYNC_DEL, err)
+		}
+		if syncD {
+			syncDeletes = syncD
+		}
+		log.Infof("sync DELETE enabled: %t", syncDeletes)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rbus := rbclient.New(rAddr+"/api/bus", rPass)
+	cberr := rbus.CreateBucket(ctx, bucket, rapi.CreateBucketOptions{Policy: rapi.BucketPolicy{PublicReadAccess: false}})
+	if cberr != nil {
+		//if !errors.Is(cberr, rapi.ErrBucketExists) {
+		//	return nil, fmt.Errorf("creating bucket %s using renterd bus api: %w", bucket, cberr)
+		//}
+		if !strings.Contains(cberr.Error(), "bucket already exists") {
+			return nil, fmt.Errorf("creating bucket %s using renterd bus api: %w", bucket, cberr)
+		}
+	}
+	renterd := rwclient.New(rAddr+"/api/worker", rPass)
+
 	fs := &Datastore{
 		path:         path,
 		tempPath:     tempPath,
@@ -285,6 +349,10 @@ func Open(path string, syncFiles bool) (*Datastore, error) {
 		done:         make(chan struct{}),
 		diskUsage:    0,
 		opMap:        new(opMap),
+		wClient:      renterd,
+		bClient:      rbus,
+		bucket:       bucket,
+		syncDeletes:  syncDeletes,
 	}
 
 	// This sets diskUsage to the correct value
@@ -326,7 +394,7 @@ func (fs *Datastore) encode(key datastore.Key) (dir, file string) {
 
 // decode returns the datastore.Key corresponding to a file name, according
 // to the sharding function.
-func (fs *Datastore) decode(file string) (key datastore.Key, ok bool) {
+func (fs *Datastore) decode(file string) (datastore.Key, bool) {
 	if !strings.HasSuffix(file, extension) {
 		// We expect random files like "put-". Log when we encounter
 		// others.
@@ -361,7 +429,7 @@ func (fs *Datastore) makeDir(dir string) error {
 
 // makeDirNoSync create a directory on disk and report if it was created or
 // already existed.
-func (fs *Datastore) makeDirNoSync(dir string) (created bool, err error) {
+func (fs *Datastore) makeDirNoSync(dir string) (bool, error) {
 	if err := os.Mkdir(dir, 0755); err != nil {
 		if os.IsExist(err) {
 			return false, nil
@@ -429,6 +497,7 @@ func (fs *Datastore) Put(ctx context.Context, key datastore.Key, value []byte) e
 		typ: opPut,
 		key: key,
 		v:   value,
+		ctx: ctx,
 	})
 	return err
 }
@@ -446,9 +515,9 @@ func (fs *Datastore) Sync(ctx context.Context, prefix datastore.Key) error {
 func (fs *Datastore) doOp(oper *op) error {
 	switch oper.typ {
 	case opPut:
-		return fs.doPut(oper.key, oper.v)
+		return fs.doPut(oper.ctx, oper.key, oper.v)
 	case opDelete:
-		return fs.doDelete(oper.key)
+		return fs.doDelete(oper.ctx, oper.key)
 	case opRename:
 		return fs.renameAndUpdateDiskUsage(oper.tmp, oper.path)
 	default:
@@ -457,11 +526,12 @@ func (fs *Datastore) doOp(oper *op) error {
 }
 
 func isTooManyFDError(err error) bool {
-	perr, ok := err.(*os.PathError)
-	if ok && perr.Err == syscall.EMFILE {
-		return true
+	var perr *os.PathError
+	if errors.As(err, &perr) {
+		if errors.Is(perr, syscall.EMFILE) {
+			return true
+		}
 	}
-
 	return false
 }
 
@@ -474,7 +544,7 @@ func isTooManyFDError(err error) bool {
 //
 // done is true if we actually performed the operation, false if we skipped or
 // failed.
-func (fs *Datastore) doWriteOp(oper *op) (done bool, err error) {
+func (fs *Datastore) doWriteOp(oper *op) (bool, error) {
 	keyStr := oper.key.String()
 
 	opRes := fs.opMap.Begin(keyStr)
@@ -482,7 +552,7 @@ func (fs *Datastore) doWriteOp(oper *op) (done bool, err error) {
 		return false, nil
 	}
 
-	err = fs.doOp(oper)
+	err := fs.doOp(oper)
 
 	// Finish it. If no error, it will signal other operations
 	// waiting on this result to succeed. Otherwise, they will
@@ -491,7 +561,7 @@ func (fs *Datastore) doWriteOp(oper *op) (done bool, err error) {
 	return err == nil, err
 }
 
-func (fs *Datastore) doPut(key datastore.Key, val []byte) error {
+func (fs *Datastore) doPut(ctx context.Context, key datastore.Key, val []byte) error {
 
 	dir, path := fs.encode(key)
 	if err := fs.makeDir(dir); err != nil {
@@ -528,6 +598,13 @@ func (fs *Datastore) doPut(key datastore.Key, val []byte) error {
 	}
 	closed = true
 
+	_, rpath := fs.encodeForRenterd(key)
+
+	_, err = fs.wClient.UploadObject(ctx, bytes.NewReader(val), fs.bucket, rpath, rapi.UploadObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to upload the object %s to renterd backend: %w", rpath, err)
+	}
+
 	err = fs.renameAndUpdateDiskUsage(tmp.Name(), path)
 	if err != nil {
 		return err
@@ -539,10 +616,11 @@ func (fs *Datastore) doPut(key datastore.Key, val []byte) error {
 			return err
 		}
 	}
+
 	return nil
 }
 
-func (fs *Datastore) putMany(data map[datastore.Key][]byte) error {
+func (fs *Datastore) putMany(ctx context.Context, data map[datastore.Key][]byte) error {
 	fs.shutdownLock.RLock()
 	defer fs.shutdownLock.RUnlock()
 	if fs.shutdown {
@@ -625,6 +703,11 @@ func (fs *Datastore) putMany(data map[datastore.Key][]byte) error {
 		if _, err := tmp.Write(value); err != nil {
 			return err
 		}
+		_, rpath := fs.encodeForRenterd(key)
+		_, err = fs.wClient.UploadObject(ctx, bytes.NewReader(value), fs.bucket, rpath, rapi.UploadObjectOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to upload the objects to renterd backend: %w", err)
+		}
 	}
 
 	// Now we sync everything
@@ -667,17 +750,21 @@ func (fs *Datastore) putMany(data map[datastore.Key][]byte) error {
 	return nil
 }
 
-func (fs *Datastore) Get(ctx context.Context, key datastore.Key) (value []byte, err error) {
+func (fs *Datastore) Get(ctx context.Context, key datastore.Key) ([]byte, error) {
 	// Can't exist in datastore.
 	if !keyIsValid(key) {
 		return nil, datastore.ErrNotFound
 	}
 
-	_, path := fs.encode(key)
+	dir, path := fs.encode(key)
 	data, err := readFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, datastore.ErrNotFound
+			b, rerr := fs.restoreFromRenterd(ctx, dir, path, key)
+			if rerr != nil {
+				log.Debugf("Op: Get: error restoring from renterd to flatfs: %s", rerr)
+			}
+			return b, nil
 		}
 		// no specific error to return, so just pass it through
 		return nil, err
@@ -685,35 +772,54 @@ func (fs *Datastore) Get(ctx context.Context, key datastore.Key) (value []byte, 
 	return data, nil
 }
 
-func (fs *Datastore) Has(ctx context.Context, key datastore.Key) (exists bool, err error) {
+func (fs *Datastore) Has(ctx context.Context, key datastore.Key) (bool, error) {
 	// Can't exist in datastore.
 	if !keyIsValid(key) {
 		return false, nil
 	}
 
-	_, path := fs.encode(key)
+	dir, path := fs.encode(key)
 	switch _, err := os.Stat(path); {
 	case err == nil:
 		return true, nil
 	case os.IsNotExist(err):
-		return false, nil
+		_, rerr := fs.restoreFromRenterd(ctx, dir, path, key)
+		if rerr != nil {
+			log.Debugf("Op: Has: error restoring from renterd to flatfs: %s", rerr)
+			return false, nil
+		}
+		return true, nil
+		//return false, nil
 	default:
 		return false, err
 	}
 }
 
-func (fs *Datastore) GetSize(ctx context.Context, key datastore.Key) (size int, err error) {
+func (fs *Datastore) GetSize(ctx context.Context, key datastore.Key) (int, error) {
 	// Can't exist in datastore.
 	if !keyIsValid(key) {
 		return -1, datastore.ErrNotFound
 	}
 
-	_, path := fs.encode(key)
+	dir, path := fs.encode(key)
 	switch s, err := os.Stat(path); {
 	case err == nil:
 		return int(s.Size()), nil
 	case os.IsNotExist(err):
-		return -1, datastore.ErrNotFound
+		_, rerr := fs.restoreFromRenterd(ctx, dir, path, key)
+		if rerr != nil {
+			log.Debugf("Op: Has: error restoring from renterd to flatfs: %s", rerr)
+			return -1, datastore.ErrNotFound
+		}
+		s1, err1 := os.Stat(path)
+		if err1 != nil && os.IsNotExist(err1) {
+			return -1, datastore.ErrNotFound
+		}
+		if err1 != nil {
+			return -1, err1
+		}
+		return int(s1.Size()), nil
+
 	default:
 		return -1, err
 	}
@@ -738,13 +844,14 @@ func (fs *Datastore) Delete(ctx context.Context, key datastore.Key) error {
 		typ: opDelete,
 		key: key,
 		v:   nil,
+		ctx: ctx,
 	})
 	return err
 }
 
 // This function always runs within an opLock for the given
 // key, and not concurrently.
-func (fs *Datastore) doDelete(key datastore.Key) error {
+func (fs *Datastore) doDelete(ctx context.Context, key datastore.Key) error {
 	_, path := fs.encode(key)
 
 	fSize := fileSize(path)
@@ -762,6 +869,20 @@ func (fs *Datastore) doDelete(key datastore.Key) error {
 	if err == nil {
 		atomic.AddInt64(&fs.diskUsage, -fSize)
 		fs.checkpointDiskUsage()
+		if fs.syncDeletes {
+			_, rpath := fs.encodeForRenterd(key)
+			err := fs.wClient.DeleteObject(ctx, fs.bucket, rpath, rapi.DeleteObjectOptions{})
+			if err != nil {
+				//if errors.Is(err, rapi.ErrObjectNotFound) {
+				//	return nil
+				//}
+				if strings.Contains(err.Error(), "object not found") {
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
 	}
 
 	return err
@@ -1227,6 +1348,66 @@ func (fs *Datastore) Close() error {
 	return nil
 }
 
+func (fs *Datastore) restoreFromRenterd(ctx context.Context, dir, path string, key datastore.Key) ([]byte, error) {
+	_, rpath := fs.encodeForRenterd(key)
+	resp, err := fs.wClient.GetObject(ctx, fs.bucket, rpath, rapi.DownloadObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(resp.Content)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := fs.makeDir(dir); err != nil {
+		return nil, err
+	}
+
+	tmp, err := fs.tempFile()
+	if err != nil {
+		return nil, err
+	}
+	closed := false
+	removed := false
+	defer func() {
+		if !closed {
+			// silence errcheck
+			_ = tmp.Close()
+		}
+		if !removed {
+			// silence errcheck
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+
+	if _, err := tmp.Write(b); err != nil {
+		return nil, err
+	}
+	if fs.sync {
+		if err := syncFile(tmp); err != nil {
+			return nil, err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	closed = true
+
+	err = fs.renameAndUpdateDiskUsage(tmp.Name(), path)
+	if err != nil {
+		return nil, err
+	}
+	removed = true
+
+	if fs.sync {
+		if err := syncDir(dir); err != nil {
+			return nil, err
+		}
+	}
+
+	return b, nil
+}
+
 type flatfsBatch struct {
 	puts    map[datastore.Key][]byte
 	deletes map[datastore.Key]struct{}
@@ -1258,7 +1439,7 @@ func (bt *flatfsBatch) Delete(ctx context.Context, key datastore.Key) error {
 }
 
 func (bt *flatfsBatch) Commit(ctx context.Context) error {
-	if err := bt.ds.putMany(bt.puts); err != nil {
+	if err := bt.ds.putMany(ctx, bt.puts); err != nil {
 		return err
 	}
 
@@ -1269,4 +1450,14 @@ func (bt *flatfsBatch) Commit(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// encodeForRenterd returns the directory and file names for a given key according to
+// the sharding function and adjusts it for Renterd bucket path
+func (fs *Datastore) encodeForRenterd(key datastore.Key) (dir, file string) {
+	noslash := key.String()[1:]
+	bdir := filepath.Base(fs.path)
+	dir = filepath.Join(bdir, fs.getDir(noslash))
+	file = filepath.Join(dir, noslash+extension)
+	return dir, file
 }
