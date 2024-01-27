@@ -13,8 +13,8 @@ See the restrictions section for details.
 
 ## Lead Maintainer
 
-[Mayank Pandey](https://github.com/LexLuthr)
-[Alvin Reyes](https://github.com/alvin-reyes)
+- [Mayank Pandey](https://github.com/LexLuthr)
+- [Alvin Reyes](https://github.com/alvin-reyes)
 
 ## Table of Contents
 
@@ -26,7 +26,6 @@ See the restrictions section for details.
 ## Install
 
 `sia-ds` can be used like any Go module:
-
 
 ```
 import "github.com/IPFSR/sia-ds"
