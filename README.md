@@ -60,9 +60,9 @@ Please make sure to setup your renterd() first. Once it is running, export the f
 ```shell
 git clone https://github.com/IPFSR/kubo
 ```
-* Checkout the `feat/sia-ds` branch and build the binary
+* Enter the directory and build the binary
 ```shell
-git checkout feat/sia-ds
+cd kubo
 make build
 ```
 * Export the `IPFS_SIA_RENTERD_PASSWORD` and `IPFS_SIA_RENTERD_WORKER_ADDRESS` environment variables.
